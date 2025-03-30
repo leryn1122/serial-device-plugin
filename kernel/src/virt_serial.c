@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/serial_core.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/tty.h>
 #include <linux/version.h>
 
@@ -17,13 +18,16 @@
 
 #include "virt_serial.h"
 
-#define UART_NAME_SIZE 16
-#define DEBUG_MODE 1s
+// Macro for build
+
+#define DEBUG_MODE 1
 
 // kfifo
 #define FIFO_SIZE 4096
 DEFINE_KFIFO(rx_fifo, char, FIFO_SIZE);
 DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
+
+// misc.
 
 #define IOCTL_FETCH_ARGS(parameter, retval) \
     if (!access_ok((void __user*) parameter, sizeof(retval))) \
@@ -36,14 +40,79 @@ DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
         return -EFAULT; \
     }
 
+/**
+ * UART driver for virtual serial device.
+ * Core struct for driver with implementations.
+ */
 static struct uart_driver virt_serial_driver;
+/**
+ * UART ioctl operations for virtual serial device.
+ */
 static struct file_operations virt_serial_ctrl_fops;
+
+/**
+ * Virtual serial driver control device called `/dev/vrtscrl`
+ */
 static dev_t virt_serial_ctrl_dev;
 static struct cdev virt_serial_ctrl_cdev;
 static struct class *virt_serial_ctrl_class;
 
 static LIST_HEAD(virt_serial_port_list);
 static DEFINE_MUTEX(virt_serial_lock);
+
+// UART driver implementations
+
+static unsigned int virt_serial_tx_empty(struct uart_port*);
+static void virt_serial_set_mctrl(struct uart_port*, unsigned int mctrl);
+static unsigned int virt_serial_get_mctrl(struct uart_port*);
+static void virt_serial_stop_tx(struct uart_port*);
+static void virt_serial_start_tx(struct uart_port*);
+static void virt_serial_send_xchar(struct uart_port*, char ch);
+static void virt_serial_stop_rx(struct uart_port*);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+static void virt_serial_start_rx(struct uart_port*);
+#endif
+static void virt_serial_enable_ms(struct uart_port*);
+static void virt_serial_break_ctl(struct uart_port*, int break_state);
+static int virt_serial_startup(struct uart_port*);
+static void virt_serial_shutdown(struct uart_port*);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+static void virt_serial_set_termios(struct uart_port*, struct ktermios *termios, const struct ktermios *old);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+static void virt_serial_set_termios(struct uart_port*, struct ktermios *termios, struct ktermios *old);
+#endif
+static void virt_serial_pm(struct uart_port *port, unsigned int state, unsigned int oldstate);
+static const char* virt_serial_type(struct uart_port*);
+static void virt_serial_release_port(struct uart_port*);
+static int virt_serial_request_port(struct uart_port*);
+static void virt_serial_config_port(struct uart_port*, int type);
+static int virt_serial_verify_port(struct uart_port*, struct serial_struct *serial);
+static int virt_serial_uart_ioctl(struct uart_port*, unsigned int request, unsigned long args);
+#ifdef CONFIG_CONSOLE_POLL
+static int virt_serial_poll_init(struct uart_port*);
+static void virt_serial_poll_put_char(struct uart_port*, unsigned char ch);
+static int virt_serial_poll_get_char(struct uart_port*);
+#endif
+
+/**
+ * ioctl - control device /dev/vrtsctl
+ */
+static long virt_serial_ioctl(struct file *file, unsigned int request, unsigned long args);
+
+/**
+ * Struct for virtual serial port.
+ */
+struct virt_serial_port
+{
+    char devname[16] ;
+    struct uart_port port;
+    bool tx_enable_flag;
+    bool rx_enable_flag;
+    struct kfifo rx_fifo;
+    struct kfifo tx_fifo;
+    spinlock_t write_lock;
+    struct list_head list;
+} virt_serial_port;
 
 static struct uart_driver virt_serial_driver = {
     .owner          = THIS_MODULE,
@@ -56,7 +125,8 @@ static struct uart_driver virt_serial_driver = {
 };
 
 /**
- * https://www.kernel.org/doc/html/latest/driver-api/serial/driver.html#c.uart_ops
+ * See also:
+ *   https://www.kernel.org/doc/html/latest/driver-api/serial/driver.html#c.uart_ops
  */
 static const struct uart_ops virt_serial_ops = {
     .tx_empty       = virt_serial_tx_empty        ,
@@ -98,6 +168,9 @@ static struct platform_driver virt_serial_platform_driver = {
 };
 */
 
+/**
+ * This function tests whether the transmitter fifo and shifter for the port is empty.
+ */
 static unsigned int virt_serial_tx_empty(struct uart_port *port)
 {
 //    struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -106,17 +179,27 @@ static unsigned int virt_serial_tx_empty(struct uart_port *port)
     return TIOCSER_TEMT;
 }
 
+/**
+ * This function sets the modem control lines for port to the state described by mctrl.
+ */
 static void virt_serial_set_mctrl(struct uart_port *uart_port, unsigned int mctrl)
 {
     // Intentionally left blank with empty implementation.
 }
 
+/**
+ * Returns the current state of modem control inputs of port.
+ */
 static unsigned int virt_serial_get_mctrl(struct uart_port *uart_port)
 {
     // Intentionally left blank with empty implementation.
     return TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
 }
 
+/**
+ * Stop transmitting characters. This might be due to the CTS line becoming inactive or the tty layer indicating
+ * we want to stop transmission due to an XOFF character.
+ */
 static void virt_serial_stop_tx(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -129,6 +212,9 @@ static void virt_serial_stop_tx(struct uart_port *port)
     spin_unlock_irqrestore(&serial_port->write_lock, flags);
 }
 
+/**
+ * Start transmitting characters.
+ */
 static void virt_serial_start_tx(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -141,11 +227,19 @@ static void virt_serial_start_tx(struct uart_port *port)
     spin_unlock_irqrestore(&serial_port->write_lock, flags);
 }
 
+/**
+ * Transmit a high priority character, even if the port is stopped. This is used to implement XON/XOFF flow
+ * control and tcflow(). If the serial driver does not implement this function, the tty core will append
+ * the character to the circular buffer and then call start_tx() / stop_tx() to flush the data out.
+ */
 static void virt_serial_send_xchar(struct uart_port *port, char ch)
 {
     // TODO
 }
 
+/**
+ * Stop receiving characters; the port is in the process of being closed.
+ */
 static void virt_serial_stop_rx(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -159,6 +253,9 @@ static void virt_serial_stop_rx(struct uart_port *port)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+/**
+ * Start receiving characters.
+ */
 static void virt_serial_start_rx(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -172,16 +269,27 @@ static void virt_serial_start_rx(struct uart_port *port)
 }
 #endif
 
+/**
+ * Enable the modem status interrupts.
+ */
 static void virt_serial_enable_ms(struct uart_port *port)
 {
     // Intentionally left blank with empty implementation.
 }
 
+/**
+ * Control the transmission of a break signal. If ctl is nonzero, the break signal should be transmitted.
+ * The signal should be terminated when another call is made with a zero ctl.
+ */
 static void virt_serial_break_ctl(struct uart_port *port, int break_state)
 {
     // Intentionally left blank with empty implementation.
 }
 
+/**
+ * Grab any interrupt resources and initialise any low level driver state. Enable the port for reception. It
+ * should not activate RTS nor DTR; this will be done via a separate call to set_mctrl().
+ */
 static int virt_serial_startup(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -196,23 +304,28 @@ static int virt_serial_startup(struct uart_port *port)
     if (kfifo_alloc(&serial_port->rx_fifo, FIFO_SIZE, GFP_KERNEL))
     {
         ret = -ENOMEM;
-        goto err_exit;
+        goto fail_exit;
     }
     if (kfifo_alloc(&serial_port->tx_fifo, FIFO_SIZE, GFP_KERNEL)) {
         kfifo_free(&serial_port->rx_fifo);
         ret = -ENOMEM;
-        goto err_exit;
+        goto fail_exit;
     }
 
     spin_unlock_irqrestore(&serial_port->write_lock, flags);
 
     return 0;
 
-err_exit:
+fail_exit:
     spin_unlock_irqrestore(&serial_port->write_lock, flags);
-    return -EIO;
+
+    return ret;
 }
 
+/**
+ * Disable the port, disable any break condition that may be in effect, and free any interrupt resources. It
+ * should not disable RTS nor DTR; this will have already been done via a separate call to set_mctrl().
+ */
 static void virt_serial_shutdown(struct uart_port *port)
 {
     struct virt_serial_port *serial_port = container_of(port, struct virt_serial_port, port);
@@ -228,6 +341,9 @@ static void virt_serial_shutdown(struct uart_port *port)
     spin_unlock_irqrestore(&serial_port->write_lock, flags);
 }
 
+/**
+ * Change the port parameters, including word length, parity, stop bits.
+ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 static void virt_serial_set_termios(struct uart_port *port, struct ktermios *termios, const struct ktermios *old)
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
@@ -271,6 +387,10 @@ static void virt_serial_set_termios(struct uart_port *port, struct ktermios *ter
     printk("baud = %d cval = %d\n", baud, cval);
 }
 
+/**
+ * Perform any power management related activities on the specified port. state indicates the new state
+ * (defined by enum uart_pm_state), oldstate indicates the previous state.
+ */
 static void virt_serial_pm(struct uart_port *port, unsigned int state, unsigned int oldstate)
 {
 #ifdef CONFIG_PM
@@ -278,16 +398,27 @@ static void virt_serial_pm(struct uart_port *port, unsigned int state, unsigned 
 #endif
 }
 
+/**
+ * Return a pointer to a string constant describing the specified port, or return NULL, in which case the
+ * string ‘unknown’ is substituted.
+ */
 static const char* virt_serial_type(struct uart_port *port)
 {
     return NULL;
 }
 
+/**
+ * Release any memory and IO region resources currently in use by the port.
+ */
 static void virt_serial_release_port(struct uart_port *port)
 {
     // TODO
 }
 
+/**
+ * Request any memory and IO region resources required by the port. If any fail, no resources should be registered
+ * when this function returns, and it should return -EBUSY on failure.
+ */
 static int virt_serial_request_port(struct uart_port *port)
 {
     if (0)
@@ -297,19 +428,40 @@ static int virt_serial_request_port(struct uart_port *port)
     return 0;
 }
 
+/**
+ * Perform any autoconfiguration steps required for the port. type contains a bit mask of the required
+ * configuration. UART_CONFIG_TYPE indicates that the port requires detection and identification. port->type
+ * should be set to the type found, or PORT_UNKNOWN if no port was detected.
+ *
+ * UART_CONFIG_IRQ indicates autoconfiguration of the interrupt signal, which should be probed using standard
+ * kernel autoprobing techniques. This is not necessary on platforms where ports have interrupts internally
+ * hard wired (eg, system on a chip implementations).
+ */
 static void virt_serial_config_port(struct uart_port*, int type)
 {
 }
 
+/**
+ * Verify the new serial port information contained within serinfo is suitable for this port type.
+ */
 static int virt_serial_verify_port(struct uart_port *port, struct serial_struct *serial)
 {
     // TODO
     return 0;
 }
 
-static int virt_serial_uart_ioctl(struct uart_port *port, unsigned int request, unsigned long args)
+/**
+ * Perform any port specific IOCTLs. IOCTL commands must be defined using the standard numbering system
+ * found in <asm/ioctl.h>.
+ */
+static int virt_serial_uart_ioctl(struct uart_port *port, unsigned int cmd, unsigned long args)
 {
-    switch (request)
+    if (_IOC_TYPE(cmd) != VIRT_SERIAL_IOCTL_MAGIC)
+    {
+        return -ENOTTY;
+    }
+
+    switch (cmd)
     {
         case VIRT_SERIAL_IOCTL_SET_BAUDRATE:
             // uart_set_baud_rate(port, args);
@@ -321,17 +473,29 @@ static int virt_serial_uart_ioctl(struct uart_port *port, unsigned int request, 
 }
 
 #ifdef CONFIG_CONSOLE_POLL
+/**
+ * Called by kgdb to perform the minimal hardware initialization needed to support poll_put_char() and
+ * poll_get_char(). Unlike startup(), this should not request interrupts.
+ */
 static int virt_serial_poll_init(struct uart_port *port)
 {
     // TODO
     return 0;
 }
 
+/**
+ * Called by kgdb to write a single character ch directly to the serial port. It can and should block until
+ * there is space in the TX FIFO.
+ */
 static void virt_serial_poll_put_char(struct uart_port *port, unsigned char ch)
 {
     // TODO
 }
 
+/**
+ * Called by kgdb to read a single character directly from the serial port. If data is available, it should
+ * be returned; otherwise the function should return NO_POLL_CHAR immediately.
+ */
 static int virt_serial_poll_get_char(struct uart_port *port)
 {
     // TODO
@@ -339,6 +503,9 @@ static int virt_serial_poll_get_char(struct uart_port *port)
 }
 #endif
 
+/**
+ * Create virtual serial port handle with given device name and baud rate.
+ */
 static int create_virt_serial_handle(char devname[16] , unsigned int baud)
 {
     int ret = 0;
@@ -347,9 +514,9 @@ static int create_virt_serial_handle(char devname[16] , unsigned int baud)
     if (!port)
     {
         ret = -ENOMEM;
-        goto err_exit;
+        goto fail_exit;
     }
-    strscpy(port->devname, devname, UART_NAME_SIZE);
+    strscpy(port->devname, devname, DEVICE_NAME_SIZE);
     port->tx_enable_flag = false;
     port->rx_enable_flag = false;
 
@@ -357,7 +524,7 @@ static int create_virt_serial_handle(char devname[16] , unsigned int baud)
     u_port = kzalloc(sizeof(*u_port), GFP_KERNEL);
     if (!u_port) {
         ret = -ENOMEM;
-        goto err_malloc_uart_port;
+        goto fail_malloc_uart_port;
     }
     u_port->line = 0;
     u_port->type = PORT_UNKNOWN;
@@ -370,7 +537,7 @@ static int create_virt_serial_handle(char devname[16] , unsigned int baud)
     if (uart_add_one_port(&virt_serial_driver, &port->port) < 0)
     {
         ret = -EIO;
-        goto err_add_uart_port;
+        goto fail_add_uart_port;
     }
 
     mutex_lock(&virt_serial_lock);
@@ -380,14 +547,17 @@ static int create_virt_serial_handle(char devname[16] , unsigned int baud)
 
     return 0;
 
-err_add_uart_port:
+fail_add_uart_port:
     kfree(u_port);
-err_malloc_uart_port:
+fail_malloc_uart_port:
     kfree(port);
-err_exit:
+fail_exit:
     return ret;
 }
 
+/**
+ * Remove virtual serial port handle by given device name.
+ */
 static int remove_virt_serial_handle(char devname[16])
 {
     return -ENODEV;
@@ -426,6 +596,9 @@ static struct file_operations virt_serial_ctrl_fops = {
     .unlocked_ioctl = virt_serial_ioctl,
 };
 
+/**
+ * Kernel module init entrypoint
+ */
 static int __init virt_serial_init(void)
 {
     int ret;
@@ -435,13 +608,13 @@ static int __init virt_serial_init(void)
 
     if (ret < 0)
     {
-        goto err_free_driver;
+        goto fail_register_driver;
     }
 
     ret = alloc_chrdev_region(&virt_serial_ctrl_dev, 0, 1, VIRT_SERIAL_CONTROL_DEVICE);
     if (ret < 0)
     {
-        goto err_alloc_chrdev;
+        goto fail_alloc_chrdev;
     }
     cdev_init(&virt_serial_ctrl_cdev, &virt_serial_ctrl_fops);
     virt_serial_ctrl_cdev.owner = THIS_MODULE;
@@ -449,22 +622,25 @@ static int __init virt_serial_init(void)
     ret = cdev_add(&virt_serial_ctrl_cdev, virt_serial_ctrl_dev, 1);
     if (ret < 0)
     {
-        goto err_release_cdev;
+        goto fail_alloc_cdev;
     }
 
     virt_serial_ctrl_class = class_create(THIS_MODULE, VIRT_SERIAL_CONTROL_DEVICE);
     device_create(virt_serial_ctrl_class, NULL, virt_serial_ctrl_dev, NULL, VIRT_SERIAL_CONTROL_DEVICE);
     return 0;
 
-err_release_cdev:
+fail_alloc_cdev:
     unregister_chrdev_region(virt_serial_ctrl_dev, 1);
-err_alloc_chrdev:
+fail_alloc_chrdev:
     uart_unregister_driver(&virt_serial_driver);
-err_free_driver:
+fail_register_driver:
     kfree(&virt_serial_driver);
     return ret;
 }
 
+/**
+ * Kernel module exit
+ */
 static void __exit virt_serial_exit(void)
 {
     mutex_lock(&virt_serial_lock);

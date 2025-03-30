@@ -31,4 +31,10 @@ build: ## Build target artifacts
 	ln -sf $(SRC_DIR)/*.[ch]    $(BUILD_DIR)/
 	make -C $(KERNEL_DIR) M=$(BUILD_DIR) modules
 
-all: build ## build
+module_install: ## Install kernel module
+	$(MAKE) -C $(KERNEL_DIR) M=$(BUILD_DIR) modules_install
+
+module_uninstall: ## Remove kernel module
+	rmmod virt_serial
+
+all: clean build module_install ## Build
