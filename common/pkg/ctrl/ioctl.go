@@ -1,4 +1,4 @@
-package cbinding
+package ctrl
 
 import "github.com/leryn1122/serial-device-plugin/v2/lib/ioctl"
 

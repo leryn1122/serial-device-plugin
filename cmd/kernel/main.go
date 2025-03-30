@@ -2,9 +2,8 @@ package main
 
 import (
 	"fmt"
-	kernel "github.com/leryn1122/serial-device-plugin/v2/kernel/pkg/cbinding"
-	"github.com/leryn1122/serial-device-plugin/v2/lib/ioctl"
-	"github.com/urfave/cli"
+	"github.com/leryn1122/serial-device-plugin/v2/common/pkg/ctrl"
+	"github.com/urfave/cli/v2"
 	"os"
 )
 
@@ -14,19 +13,19 @@ const (
 
 func main() {
 	app := &cli.App{
-		Name:  "kernel-ioctl",
+		Name:  "ioctl-tool",
 		Usage: "Ioctl tools for kobject",
-		Commands: []cli.Command{
+		Commands: []*cli.Command{
 			{
 				Name:   "add",
 				Usage:  "Add virtual serial",
 				Action: AddVirtualSerial,
 				Flags: []cli.Flag{
-					cli.StringFlag{
-						Name:  "devname",
-						Usage: "Device name",
+					&cli.StringFlag{
+						Name:  "device",
+						Usage: "Device name, e.g. ttyVCOM0",
 					},
-					cli.UintFlag{
+					&cli.UintFlag{
 						Name:  "baud",
 						Usage: "Baud rate",
 						Value: 115200,
@@ -37,11 +36,12 @@ func main() {
 				Name:   "remove",
 				Usage:  "Remove virtual serial",
 				Action: RemoveVirtualSerial,
-			},
-			{
-				Name:   "example",
-				Usage:  "Create example virtual serial",
-				Action: CreateExampleVirtualSerial,
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "device",
+						Usage: "Device name, e.g. ttyVCOM0",
+					},
+				},
 			},
 		},
 	}
@@ -52,18 +52,17 @@ func main() {
 }
 
 func AddVirtualSerial(ctx *cli.Context) error {
-	fd, err := ioctl.Open(VirtSerialControlDevice, ioctl.O_RDWR, 0)
-	defer ioctl.Close(fd)
+	controlDevice, err := ctrl.NewControlDevice()
 	if err != nil {
 		return err
 	}
+	defer controlDevice.Close()
 
-	config := kernel.NewVirtSerialConfigBuilder().
-		SetDeviceName(ctx.String("devname")).
-		SetBaudRate(ctx.Uint("baud")).
-		Build()
-	defer config.Drop()
-	err = ioctl.Ioctl(fd, kernel.VirtSerialIoctlCreateDevice, uintptr(config.Raw()))
+	request := ctrl.CreateSerialPortRequest{
+		DeviceName: ctx.String("device"),
+		BaudRate:   ctx.Uint("baud"),
+	}
+	err = controlDevice.CreateSerialPort(request)
 	if err != nil {
 		return err
 	}
@@ -71,22 +70,16 @@ func AddVirtualSerial(ctx *cli.Context) error {
 }
 
 func RemoveVirtualSerial(ctx *cli.Context) error {
-	return nil
-}
-
-func CreateExampleVirtualSerial(ctx *cli.Context) error {
-	fd, err := ioctl.Open(VirtSerialControlDevice, ioctl.O_RDWR, 0)
-	defer ioctl.Close(fd)
+	controlDevice, err := ctrl.NewControlDevice()
 	if err != nil {
 		return err
 	}
+	defer controlDevice.Close()
 
-	config := kernel.NewVirtSerialConfigBuilder().
-		SetDeviceName("/dev/ttyVCOM0").
-		SetBaudRate(115200).
-		Build()
-	defer config.Drop()
-	err = ioctl.Ioctl(fd, kernel.VirtSerialIoctlCreateDevice, uintptr(config.Raw()))
+	request := ctrl.RemoveSerialPortRequest{
+		DeviceName: ctx.String("device"),
+	}
+	err = controlDevice.RemoveSerialPort(request)
 	if err != nil {
 		return err
 	}
