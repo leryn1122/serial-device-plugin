@@ -31,4 +31,4 @@ build: ## Build target artifacts
 	ln -sf $(SRC_DIR)/*.[ch]    $(BUILD_DIR)/
 	make -C $(KERNEL_DIR) M=$(BUILD_DIR) modules
 
-all: build
+all: build ## build

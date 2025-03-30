@@ -1,5 +1,6 @@
 #include <linux/cdev.h>
 #include <linux/errno.h>
+#include <linux/ioctl.h>
 #include <linux/kernel.h>
 #include <linux/kfifo.h>
 #include <linux/module.h>
@@ -15,6 +16,9 @@
 #endif // _LINUX_SERIAL_REG_H
 
 #include "virt_serial.h"
+
+#define UART_NAME_SIZE 16
+#define DEBUG_MODE 1s
 
 // kfifo
 #define FIFO_SIZE 4096
@@ -335,38 +339,67 @@ static int virt_serial_poll_get_char(struct uart_port *port)
 }
 #endif
 
-static int create_virt_serial_handle(const char* devname, unsigned int baud)
+static int create_virt_serial_handle(char devname[16] , unsigned int baud)
 {
+    int ret = 0;
     struct virt_serial_port *port;
     port = kzalloc(sizeof(*port), GFP_KERNEL);
-    if (port) {
-        return -ENOMEM;
+    if (!port)
+    {
+        ret = -ENOMEM;
+        goto err_exit;
     }
-
-    // strscpy(port->devname, devname, sizeof(devname));
+    strscpy(port->devname, devname, UART_NAME_SIZE);
     port->tx_enable_flag = false;
     port->rx_enable_flag = false;
 
-    if (uart_add_one_port(&virt_serial_driver, &port->port))
+    struct uart_port *u_port;
+    u_port = kzalloc(sizeof(*u_port), GFP_KERNEL);
+    if (!u_port) {
+        ret = -ENOMEM;
+        goto err_malloc_uart_port;
+    }
+    u_port->line = 0;
+    u_port->type = PORT_UNKNOWN;
+    u_port->ops = &virt_serial_ops;
+    u_port->flags = UPF_BOOT_AUTOCONF;
+    u_port->dev = NULL;
+    port->port = *u_port;
+
+    printk(KERN_INFO "Start uart_add_one_port");
+    if (uart_add_one_port(&virt_serial_driver, &port->port) < 0)
     {
-        kfree(port);
-        return -EIO;
+        ret = -EIO;
+        goto err_add_uart_port;
     }
 
     mutex_lock(&virt_serial_lock);
+    printk(KERN_INFO "Start list_add_tail");
     list_add_tail(&port->list, &virt_serial_port_list);
     mutex_unlock(&virt_serial_lock);
 
     return 0;
+
+err_add_uart_port:
+    kfree(u_port);
+err_malloc_uart_port:
+    kfree(port);
+err_exit:
+    return ret;
 }
 
-static int remove_virt_serial_handle(const char* devname)
+static int remove_virt_serial_handle(char devname[16])
 {
     return -ENODEV;
 }
 
 static long virt_serial_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 {
+    if (_IOC_TYPE(cmd) != VIRT_SERIAL_IOCTL_MAGIC)
+    {
+        return -ENOTTY;
+    }
+
     switch (cmd)
     {
         case VIRT_SERIAL_IOCTL_CREATE_DEVICE:
@@ -375,10 +408,14 @@ static long virt_serial_ioctl(struct file *file, unsigned int cmd, unsigned long
 
             return create_virt_serial_handle(config.devname, config.baud);
         case VIRT_SERIAL_IOCTL_REMOVE_DEVICE:
-            const char *devname;
+            char devname[16];
             IOCTL_FETCH_ARGS(args, devname);
 
             return remove_virt_serial_handle(devname);
+        case VIRT_SERIAL_IOCTL_PRESERVE:
+#ifdef DEBUG_MODE
+            return create_virt_serial_handle("VCOM0", 115200);
+#endif // DEBUG_MODE
         default:
             return -ENOTTY;
     }
@@ -401,7 +438,7 @@ static int __init virt_serial_init(void)
         goto err_free_driver;
     }
 
-    ret = alloc_chrdev_region(&virt_serial_ctrl_dev, 0, 1, "vrtsctl");
+    ret = alloc_chrdev_region(&virt_serial_ctrl_dev, 0, 1, VIRT_SERIAL_CONTROL_DEVICE);
     if (ret < 0)
     {
         goto err_alloc_chrdev;
@@ -415,8 +452,8 @@ static int __init virt_serial_init(void)
         goto err_release_cdev;
     }
 
-    virt_serial_ctrl_class = class_create(THIS_MODULE, "vrtsctl");
-    device_create(virt_serial_ctrl_class, NULL, virt_serial_ctrl_dev, NULL, "vrtsctl");
+    virt_serial_ctrl_class = class_create(THIS_MODULE, VIRT_SERIAL_CONTROL_DEVICE);
+    device_create(virt_serial_ctrl_class, NULL, virt_serial_ctrl_dev, NULL, VIRT_SERIAL_CONTROL_DEVICE);
     return 0;
 
 err_release_cdev:

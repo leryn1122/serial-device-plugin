@@ -5,6 +5,12 @@
 
 #include <linux/kernel.h>
 
+// module info
+#define DRIVER_LICENSE     "GPL"
+#define DRIVER_VERSION     "v0.0.1"
+#define DRIVER_AUTHOR      "Leryn <leryn1122@github.com>"
+#define DRIVER_DESCRIPTION "Virtual Serial Port Driver"
+
 // uart driver
 #define VIRT_SERIAL_DRIVER_NAME   "virt-serial"
 #define VIRT_SERIAL_DEVICE_PREFIX "ttyVCOM"
@@ -12,18 +18,14 @@
 #define VIRT_SERIAL_MINOR 0
 #define VIRT_SERIAL_NR    4
 #define VIRT_SERIAL_MIN_SPEED 57600
-#define VIRT_SERIAL_MAX_SPEED 1152000
+#define VIRT_SERIAL_MAX_SPEED 115200
 
-// module info
-#define DRIVER_LICENSE     "GPL"
-#define DRIVER_VERSION     "v0.0.1"
-#define DRIVER_AUTHOR      "Leryn <leryn1122@github.com>"
-#define DRIVER_DESCRIPTION "Virtual Serial Port Driver"
+#define VIRT_SERIAL_CONTROL_DEVICE  "vrtsctl"
 
 // ioctl
-#define VIRT_SERIAL_IOCTL_MAGIC 'V'
+#define VIRT_SERIAL_IOCTL_MAGIC 0xB8
 // ioctl - vrtsctl
-#define VIRT_SERIAL_IOCTL_PRESERVER     _IO(VIRT_SERIAL_IOCTL_MAGIC, 0)
+#define VIRT_SERIAL_IOCTL_PRESERVE      _IO(VIRT_SERIAL_IOCTL_MAGIC, 0)
 #define VIRT_SERIAL_IOCTL_CREATE_DEVICE _IOW(VIRT_SERIAL_IOCTL_MAGIC, 1, struct virt_serial_config)
 #define VIRT_SERIAL_IOCTL_REMOVE_DEVICE _IOW(VIRT_SERIAL_IOCTL_MAGIC, 2, char[16])
 // ioctl - uart
@@ -31,7 +33,7 @@
 
 struct virt_serial_port
 {
-    const char* name;
+    char devname[16] ;
     struct uart_port port;
     bool tx_enable_flag;
     bool rx_enable_flag;
@@ -39,17 +41,13 @@ struct virt_serial_port
     struct kfifo tx_fifo;
     spinlock_t write_lock;
     struct list_head list;
-};
+} virt_serial_port;
 
 struct virt_serial_config
 {
-    const char* devname;
+    char devname[16] ;
     unsigned int baud;
-};
-
-static struct uart_driver virt_serial_driver;
-static struct file_operations virt_serial_ctrl_fops;
-static struct cdev virt_serial_ctrl_cdev;
+} virt_serial_config;
 
 static unsigned int virt_serial_tx_empty(struct uart_port *port);
 static void virt_serial_set_mctrl(struct uart_port *uart_port, unsigned int mctrl);
