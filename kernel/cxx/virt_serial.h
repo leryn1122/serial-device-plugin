@@ -31,7 +31,7 @@
 
 #define VIRT_SERIAL_IOCTL_PRESERVE      _IO(VIRT_SERIAL_IOCTL_MAGIC, 0)
 #define VIRT_SERIAL_IOCTL_CREATE_DEVICE _IOW(VIRT_SERIAL_IOCTL_MAGIC, 1, struct virt_serial_config)
-#define VIRT_SERIAL_IOCTL_REMOVE_DEVICE _IOW(VIRT_SERIAL_IOCTL_MAGIC, 2, char[16])
+#define VIRT_SERIAL_IOCTL_REMOVE_DEVICE _IOW(VIRT_SERIAL_IOCTL_MAGIC, 2, devname_t)
 
 // ioctl - UART
 
@@ -41,10 +41,27 @@
 
 #define DEVICE_NAME_SIZE 16
 
+typedef unsigned int baud_t;
+typedef char devname_t[DEVICE_NAME_SIZE];
+
 struct virt_serial_config
 {
     char devname[DEVICE_NAME_SIZE] ;
-    unsigned int baud;
+    baud_t baud;
 } virt_serial_config;
+
+/**
+ * Struct for virtual serial port.
+ */
+struct virt_serial_port
+{
+    char devname[DEVICE_NAME_SIZE] ;
+    struct uart_port port;
+    bool tx_enable_flag;
+    bool rx_enable_flag;
+    struct kfifo rx_fifo;
+    struct kfifo tx_fifo;
+    spinlock_t write_lock;
+} virt_serial_port;
 
 #endif // _VIRT_SERIAL_H

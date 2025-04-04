@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/kfifo.h>
 #include <linux/module.h>
+#include <linux/platform_device.h>
 #include <linux/serial_core.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -11,23 +12,12 @@
 #include <linux/version.h>
 
 #ifdef _LINUX_SERIAL_REG_H
-#include <linux/serial_reg.h>
+#  include <linux/serial_reg.h>
 #else
-#include <uapi/linux/serial_reg.h>
+#  include <uapi/linux/serial_reg.h>
 #endif // _LINUX_SERIAL_REG_H
 
 #include "virt_serial.h"
-
-// Macro for build
-
-#define DEBUG_MODE 1
-
-// kfifo
-#define FIFO_SIZE 4096
-DEFINE_KFIFO(rx_fifo, char, FIFO_SIZE);
-DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
-
-// misc.
 
 #define IOCTL_FETCH_ARGS(parameter, retval) \
     if (!access_ok((void __user*) parameter, sizeof(retval))) \
@@ -40,25 +30,20 @@ DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
         return -EFAULT; \
     }
 
+//============================================================================//
+// virt_serial_uart.c
+//============================================================================//
+
 /**
  * UART driver for virtual serial device.
  * Core struct for driver with implementations.
  */
-static struct uart_driver virt_serial_driver;
+// NOLINTNEXTLINE(*-interfaces-global-init)
+static struct uart_driver virt_serial_drv;
 /**
  * UART ioctl operations for virtual serial device.
  */
-static struct file_operations virt_serial_ctrl_fops;
-
-/**
- * Virtual serial driver control device called `/dev/vrtscrl`
- */
-static dev_t virt_serial_ctrl_dev;
-static struct cdev virt_serial_ctrl_cdev;
-static struct class *virt_serial_ctrl_class;
-
-static LIST_HEAD(virt_serial_port_list);
-static DEFINE_MUTEX(virt_serial_lock);
+static const struct uart_ops virt_serial_uart_ops;
 
 // UART driver implementations
 
@@ -87,34 +72,233 @@ static void virt_serial_release_port(struct uart_port*);
 static int virt_serial_request_port(struct uart_port*);
 static void virt_serial_config_port(struct uart_port*, int type);
 static int virt_serial_verify_port(struct uart_port*, struct serial_struct *serial);
-static int virt_serial_uart_ioctl(struct uart_port*, unsigned int request, unsigned long args);
+static int virt_serial_uart_ioctl(struct uart_port*, unsigned int cmd, unsigned long args);
 #ifdef CONFIG_CONSOLE_POLL
 static int virt_serial_poll_init(struct uart_port*);
 static void virt_serial_poll_put_char(struct uart_port*, unsigned char ch);
 static int virt_serial_poll_get_char(struct uart_port*);
 #endif
 
-/**
- * ioctl - control device /dev/vrtsctl
- */
-static long virt_serial_ioctl(struct file *file, unsigned int request, unsigned long args);
+//============================================================================//
+// virt_serial_plt_drv.c
+//============================================================================//
+
+static int virt_serial_plt_drv_probe(struct platform_device*);
+
+static int virt_serial_plt_drv_remove(struct platform_device*);
 
 /**
- * Struct for virtual serial port.
+ * Platform driver for virtual serial driver.
  */
-struct virt_serial_port
+// NOLINTNEXTLINE(*-interfaces-global-init)
+static struct platform_driver virt_serial_plt_drv = {
+    .driver = {
+        .name = VIRT_SERIAL_DRIVER_NAME,
+        .owner = THIS_MODULE,
+    },
+    .probe = virt_serial_plt_drv_probe,
+    .remove = virt_serial_plt_drv_remove,
+};
+
+// module_platform_driver(virt_serial_drv);
+
+static int virt_serial_plt_drv_probe(struct platform_device *pdev)
 {
-    char devname[16] ;
-    struct uart_port port;
-    bool tx_enable_flag;
-    bool rx_enable_flag;
-    struct kfifo rx_fifo;
-    struct kfifo tx_fifo;
-    spinlock_t write_lock;
-    struct list_head list;
-} virt_serial_port;
+    int ret = 0;
+    return ret;
+}
 
-static struct uart_driver virt_serial_driver = {
+static int virt_serial_plt_drv_remove(struct platform_device *pdev)
+{
+    int ret = 0;
+    return ret;
+}
+
+/**
+* Remove virtual serial port handle by given device name.
+ */
+static int remove_virt_serial_handle(devname_t devname)
+{
+    return -ENODEV;
+}
+
+/**
+ * Create virtual serial port handle with given device name and baud rate.
+ */
+static struct platform_device* create_virt_serial_platform_device(const devname_t devname, baud_t baud)
+{
+    // Allocate and initialize platform device.
+    printk(KERN_INFO "allocate platform device");
+    struct platform_device *pdev = platform_device_alloc(VIRT_SERIAL_DRIVER_NAME, PLATFORM_DEVID_AUTO);
+    if (!pdev)
+    {
+        goto fail_alloc_pdev;
+    }
+
+    // Allocate and initialize virtual serial port.
+    printk(KERN_INFO "allocate virt_serial_port");
+    struct virt_serial_port *port = devm_kzalloc(&pdev->dev, sizeof(*port), GFP_KERNEL);
+    if (!port)
+    {
+        goto fail_alloc_port;
+    }
+    strscpy(port->devname, devname, DEVICE_NAME_SIZE);
+    port->tx_enable_flag = false;
+    port->rx_enable_flag = false;
+
+    // Allocate and initialize UART port.
+    printk(KERN_INFO "allocate uart_port");
+    struct uart_port *uart_port = kzalloc(sizeof(*uart_port), GFP_KERNEL);
+    if (!uart_port) {
+        goto fail_alloc_uart_port;
+    }
+    uart_port->line = pdev->id;
+    uart_port->type = PORT_UNKNOWN;
+    uart_port->dev = &pdev->dev;
+    uart_port->ops = &virt_serial_uart_ops;
+    uart_port->flags = UPF_BOOT_AUTOCONF;
+
+    port->port = *uart_port;
+    platform_set_drvdata(pdev, port);
+
+    int ret = 0;
+    printk(KERN_DEBUG "uart_add_one_port");
+    ret = uart_add_one_port(&virt_serial_drv, &port->port);
+    if (ret < 0)
+    {
+        printk(KERN_DEBUG "uart_add_one_port: %d", ret);
+        goto fail_add_uart_port;
+    }
+    printk(KERN_DEBUG "platform_device_add");
+    ret = platform_device_add(pdev);
+    if (ret < 0)
+    {
+        goto fail_add_platform_device;
+    }
+    return pdev;
+
+fail_add_platform_device:
+    uart_remove_one_port(&virt_serial_drv, &port->port);
+fail_add_uart_port:
+    printk(KERN_DEBUG "fail_add_uart_port");
+    // kfree(&uart_port);
+fail_alloc_uart_port:
+    printk(KERN_DEBUG "fail_alloc_uart_port");
+    // kfree(&port);
+fail_alloc_port:
+    printk(KERN_DEBUG "fail_alloc_port");
+    platform_device_put(pdev);
+fail_alloc_pdev:
+    return NULL;
+}
+
+static int create_virt_serial_handle(const devname_t devname, baud_t baud)
+{
+    struct platform_device *pdev = create_virt_serial_platform_device(devname, baud);
+    return !pdev ? 0 : -EIO;
+}
+
+//============================================================================//
+// virt_serial_ctrl.c
+//============================================================================//
+
+/**
+ * Ioctl operations for virtual serial driver control device.
+ */
+// NOLINTNEXTLINE(*-interfaces-global-init)
+static const struct file_operations virt_serial_ctrl_fops;
+
+/**
+ * Virtual serial driver control device called `/dev/vrtscrl`
+ */
+static dev_t virt_serial_ctrl_dev;
+static struct cdev virt_serial_ctrl_cdev;
+static struct class *virt_serial_ctrl_class;
+
+static int create_virt_serial_ctrl_dev(void)
+{
+    int ret = 0;
+    ret = alloc_chrdev_region(&virt_serial_ctrl_dev, 0, 1, VIRT_SERIAL_CONTROL_DEVICE);
+    if (ret < 0)
+    {
+        ret = -EINVAL;
+        goto fail_alloc_dev;
+    }
+    printk(KERN_DEBUG "major = %d, minor = %d\n", MAJOR(virt_serial_ctrl_dev), MINOR(virt_serial_ctrl_dev));
+
+    cdev_init(&virt_serial_ctrl_cdev, &virt_serial_ctrl_fops);
+    virt_serial_ctrl_cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&virt_serial_ctrl_cdev, virt_serial_ctrl_dev, 1);
+    if (ret < 0)
+    {
+        goto fail_add_cdev;
+    }
+
+    virt_serial_ctrl_class = class_create(THIS_MODULE, VIRT_SERIAL_CONTROL_DEVICE);
+    device_create(virt_serial_ctrl_class, NULL, virt_serial_ctrl_dev, NULL, VIRT_SERIAL_CONTROL_DEVICE);
+    return 0;
+
+fail_add_cdev:
+    kfree(&virt_serial_ctrl_cdev);
+fail_alloc_dev:
+    unregister_chrdev_region(virt_serial_ctrl_dev, 1);
+    kfree(&virt_serial_ctrl_dev);
+    return ret;
+}
+
+static void remove_virt_serial_ctrl_dev(void)
+{
+    device_destroy(virt_serial_ctrl_class, virt_serial_ctrl_cdev.dev);
+    class_destroy(virt_serial_ctrl_class);
+    cdev_del(&virt_serial_ctrl_cdev);
+    unregister_chrdev_region(virt_serial_ctrl_cdev.dev, 1);
+    kfree(&virt_serial_ctrl_cdev);
+}
+
+static long virt_serial_ctrl_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+{
+    if (_IOC_TYPE(cmd) != VIRT_SERIAL_IOCTL_MAGIC)
+    {
+        return -ENOTTY;
+    }
+
+    switch (cmd)
+    {
+        case VIRT_SERIAL_IOCTL_CREATE_DEVICE:
+            struct virt_serial_config config;
+            IOCTL_FETCH_ARGS(args, config);
+
+            return create_virt_serial_handle(config.devname, config.baud);
+        case VIRT_SERIAL_IOCTL_REMOVE_DEVICE:
+            devname_t devname;
+            IOCTL_FETCH_ARGS(args, devname);
+
+            return remove_virt_serial_handle(devname);
+        case VIRT_SERIAL_IOCTL_PRESERVE:
+            return create_virt_serial_handle("ttyVCOM0", 115200);
+        default:
+            return -ENOTTY;
+    }
+}
+
+// NOLINTNEXTLINE(*-interfaces-global-init)
+static const struct file_operations virt_serial_ctrl_fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = virt_serial_ctrl_ioctl,
+};
+
+//============================================================================//
+// virt_serial_drv.c
+//============================================================================//
+
+// kfifo
+#define FIFO_SIZE 4096
+DEFINE_KFIFO(rx_fifo, char, FIFO_SIZE);
+DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
+
+// NOLINTNEXTLINE(*-interfaces-global-init)
+static struct uart_driver virt_serial_drv = {
     .owner          = THIS_MODULE,
     .driver_name    = VIRT_SERIAL_DRIVER_NAME,
     .dev_name       = VIRT_SERIAL_DEVICE_PREFIX,
@@ -128,7 +312,7 @@ static struct uart_driver virt_serial_driver = {
  * See also:
  *   https://www.kernel.org/doc/html/latest/driver-api/serial/driver.html#c.uart_ops
  */
-static const struct uart_ops virt_serial_ops = {
+static const struct uart_ops virt_serial_uart_ops = {
     .tx_empty       = virt_serial_tx_empty        ,
     .set_mctrl      = virt_serial_set_mctrl       ,
     .get_mctrl      = virt_serial_get_mctrl       ,
@@ -157,16 +341,6 @@ static const struct uart_ops virt_serial_ops = {
     .poll_get_char  = virt_serial_poll_get_char   ,
 #endif
 };
-
-/*
-static struct platform_driver virt_serial_platform_driver = {
-    .driver = {
-        .name = VIRT_SERIAL_DRIVER_NAME,
-        .owner = THIS_MODULE,
-        // .of_match_table = VIRT_SERIAL_OF_MATCH,
-    },
-};
-*/
 
 /**
  * This function tests whether the transmitter fifo and shifter for the port is empty.
@@ -306,7 +480,8 @@ static int virt_serial_startup(struct uart_port *port)
         ret = -ENOMEM;
         goto fail_exit;
     }
-    if (kfifo_alloc(&serial_port->tx_fifo, FIFO_SIZE, GFP_KERNEL)) {
+    if (kfifo_alloc(&serial_port->tx_fifo, FIFO_SIZE, GFP_KERNEL))
+    {
         kfifo_free(&serial_port->rx_fifo);
         ret = -ENOMEM;
         goto fail_exit;
@@ -351,7 +526,7 @@ static void virt_serial_set_termios(struct uart_port *port, struct ktermios *ter
 #endif
 {
     unsigned char cval = 0;
-    unsigned int baud = 0;
+    baud_t baud = 0;
 
     switch (termios->c_cflag & CSIZE)
     {
@@ -421,11 +596,12 @@ static void virt_serial_release_port(struct uart_port *port)
  */
 static int virt_serial_request_port(struct uart_port *port)
 {
-    if (0)
+    int ret = 0;
+    if (false)
     {
-        return -EBUSY;
+        ret = -EBUSY;
     }
-    return 0;
+    return ret;
 }
 
 /**
@@ -503,138 +679,43 @@ static int virt_serial_poll_get_char(struct uart_port *port)
 }
 #endif
 
-/**
- * Create virtual serial port handle with given device name and baud rate.
- */
-static int create_virt_serial_handle(char devname[16] , unsigned int baud)
-{
-    int ret = 0;
-    struct virt_serial_port *port;
-    port = kzalloc(sizeof(*port), GFP_KERNEL);
-    if (!port)
-    {
-        ret = -ENOMEM;
-        goto fail_exit;
-    }
-    strscpy(port->devname, devname, DEVICE_NAME_SIZE);
-    port->tx_enable_flag = false;
-    port->rx_enable_flag = false;
-
-    struct uart_port *u_port;
-    u_port = kzalloc(sizeof(*u_port), GFP_KERNEL);
-    if (!u_port) {
-        ret = -ENOMEM;
-        goto fail_malloc_uart_port;
-    }
-    u_port->line = 0;
-    u_port->type = PORT_UNKNOWN;
-    u_port->ops = &virt_serial_ops;
-    u_port->flags = UPF_BOOT_AUTOCONF;
-    u_port->dev = NULL;
-    port->port = *u_port;
-
-    printk(KERN_INFO "Start uart_add_one_port");
-    if (uart_add_one_port(&virt_serial_driver, &port->port) < 0)
-    {
-        ret = -EIO;
-        goto fail_add_uart_port;
-    }
-
-    mutex_lock(&virt_serial_lock);
-    printk(KERN_INFO "Start list_add_tail");
-    list_add_tail(&port->list, &virt_serial_port_list);
-    mutex_unlock(&virt_serial_lock);
-
-    return 0;
-
-fail_add_uart_port:
-    kfree(u_port);
-fail_malloc_uart_port:
-    kfree(port);
-fail_exit:
-    return ret;
-}
-
-/**
- * Remove virtual serial port handle by given device name.
- */
-static int remove_virt_serial_handle(char devname[16])
-{
-    return -ENODEV;
-}
-
-static long virt_serial_ioctl(struct file *file, unsigned int cmd, unsigned long args)
-{
-    if (_IOC_TYPE(cmd) != VIRT_SERIAL_IOCTL_MAGIC)
-    {
-        return -ENOTTY;
-    }
-
-    switch (cmd)
-    {
-        case VIRT_SERIAL_IOCTL_CREATE_DEVICE:
-            struct virt_serial_config config;
-            IOCTL_FETCH_ARGS(args, config);
-
-            return create_virt_serial_handle(config.devname, config.baud);
-        case VIRT_SERIAL_IOCTL_REMOVE_DEVICE:
-            char devname[16];
-            IOCTL_FETCH_ARGS(args, devname);
-
-            return remove_virt_serial_handle(devname);
-        case VIRT_SERIAL_IOCTL_PRESERVE:
-#ifdef DEBUG_MODE
-            return create_virt_serial_handle("VCOM0", 115200);
-#endif // DEBUG_MODE
-        default:
-            return -ENOTTY;
-    }
-}
-
-static struct file_operations virt_serial_ctrl_fops = {
-    .owner = THIS_MODULE,
-    .unlocked_ioctl = virt_serial_ioctl,
-};
+//============================================================================//
+// virt_serial.c
+//============================================================================//
 
 /**
  * Kernel module init entrypoint
  */
 static int __init virt_serial_init(void)
 {
-    int ret;
-
+    int ret = 0;
     printk(KERN_INFO "VirtSerial driver initialized named virt_serial\n");
-    ret = uart_register_driver(&virt_serial_driver);
-
+    ret = platform_driver_register(&virt_serial_plt_drv);
     if (ret < 0)
     {
-        goto fail_register_driver;
+        goto fail_register_plt_driver;
     }
 
-    ret = alloc_chrdev_region(&virt_serial_ctrl_dev, 0, 1, VIRT_SERIAL_CONTROL_DEVICE);
+    ret = uart_register_driver(&virt_serial_drv);
     if (ret < 0)
     {
-        goto fail_alloc_chrdev;
+        goto fail_register_uart_driver;
     }
-    cdev_init(&virt_serial_ctrl_cdev, &virt_serial_ctrl_fops);
-    virt_serial_ctrl_cdev.owner = THIS_MODULE;
 
-    ret = cdev_add(&virt_serial_ctrl_cdev, virt_serial_ctrl_dev, 1);
+    ret = create_virt_serial_ctrl_dev();
     if (ret < 0)
     {
-        goto fail_alloc_cdev;
+        goto fail_create_ctrl_dev;
     }
-
-    virt_serial_ctrl_class = class_create(THIS_MODULE, VIRT_SERIAL_CONTROL_DEVICE);
-    device_create(virt_serial_ctrl_class, NULL, virt_serial_ctrl_dev, NULL, VIRT_SERIAL_CONTROL_DEVICE);
     return 0;
 
-fail_alloc_cdev:
-    unregister_chrdev_region(virt_serial_ctrl_dev, 1);
-fail_alloc_chrdev:
-    uart_unregister_driver(&virt_serial_driver);
-fail_register_driver:
-    kfree(&virt_serial_driver);
+fail_create_ctrl_dev:
+    uart_unregister_driver(&virt_serial_drv);
+fail_register_uart_driver:
+    platform_driver_unregister(&virt_serial_plt_drv);
+fail_register_plt_driver:
+    kfree(&virt_serial_plt_drv);
+    kfree(&virt_serial_drv);
     return ret;
 }
 
@@ -643,23 +724,11 @@ fail_register_driver:
  */
 static void __exit virt_serial_exit(void)
 {
-    mutex_lock(&virt_serial_lock);
-    struct virt_serial_port *port, *tmp;
-    list_for_each_entry_safe(port, tmp, &virt_serial_port_list, list) {
-       uart_remove_one_port(&virt_serial_driver, &port->port);
-       list_del(&port->list);
-       kfree(port);
-    }
-    mutex_unlock(&virt_serial_lock);
-
-    kfree(&virt_serial_lock);
-    kfree(&virt_serial_port_list);
-    device_destroy(virt_serial_ctrl_class, virt_serial_ctrl_dev);
-    class_destroy(virt_serial_ctrl_class);
-    cdev_del(&virt_serial_ctrl_cdev);
-    unregister_chrdev_region(virt_serial_ctrl_dev, 1);
-    uart_unregister_driver(&virt_serial_driver);
-    kfree(&virt_serial_driver);
+    remove_virt_serial_ctrl_dev();
+    uart_unregister_driver(&virt_serial_drv);
+    platform_driver_unregister(&virt_serial_plt_drv);
+    kfree(&virt_serial_plt_drv);
+    kfree(&virt_serial_drv);
     printk(KERN_INFO "VirtSerial driver unloaded\n");
 }
 
