@@ -30,6 +30,9 @@
         return -EFAULT; \
     }
 
+// kfifo
+#define FIFO_SIZE 4096
+
 //============================================================================//
 // virt_serial_uart.c
 //============================================================================//
@@ -145,14 +148,15 @@ static struct platform_device* create_virt_serial_platform_device(const devname_
     strscpy(port->devname, devname, DEVICE_NAME_SIZE);
     port->tx_enable_flag = false;
     port->rx_enable_flag = false;
+    // DEFINE_KFIFO(port->rx_fifo, char, FIFO_SIZE);
+    // DEFINE_KFIFO(port->tx_fifo, char, FIFO_SIZE);
 
     // Allocate and initialize UART port.
-    printk(KERN_INFO "allocate uart_port");
     struct uart_port *uart_port = kzalloc(sizeof(*uart_port), GFP_KERNEL);
     if (!uart_port) {
         goto fail_alloc_uart_port;
     }
-    uart_port->line = pdev->id;
+    uart_port->line = 0;
     uart_port->type = PORT_UNKNOWN;
     uart_port->dev = &pdev->dev;
     uart_port->ops = &virt_serial_uart_ops;
@@ -169,7 +173,6 @@ static struct platform_device* create_virt_serial_platform_device(const devname_
         printk(KERN_DEBUG "uart_add_one_port: %d", ret);
         goto fail_add_uart_port;
     }
-    printk(KERN_DEBUG "platform_device_add");
     ret = platform_device_add(pdev);
     if (ret < 0)
     {
@@ -266,15 +269,19 @@ static long virt_serial_ctrl_ioctl(struct file *file, unsigned int cmd, unsigned
     switch (cmd)
     {
         case VIRT_SERIAL_IOCTL_CREATE_DEVICE:
+        {
             struct virt_serial_config config;
             IOCTL_FETCH_ARGS(args, config);
 
             return create_virt_serial_handle(config.devname, config.baud);
+        }
         case VIRT_SERIAL_IOCTL_REMOVE_DEVICE:
+        {
             devname_t devname;
             IOCTL_FETCH_ARGS(args, devname);
 
             return remove_virt_serial_handle(devname);
+        }
         case VIRT_SERIAL_IOCTL_PRESERVE:
             return create_virt_serial_handle("ttyVCOM0", 115200);
         default:
@@ -291,11 +298,6 @@ static const struct file_operations virt_serial_ctrl_fops = {
 //============================================================================//
 // virt_serial_drv.c
 //============================================================================//
-
-// kfifo
-#define FIFO_SIZE 4096
-DEFINE_KFIFO(rx_fifo, char, FIFO_SIZE);
-DEFINE_KFIFO(tx_fifo, char, FIFO_SIZE);
 
 // NOLINTNEXTLINE(*-interfaces-global-init)
 static struct uart_driver virt_serial_drv = {
@@ -613,7 +615,7 @@ static int virt_serial_request_port(struct uart_port *port)
  * kernel autoprobing techniques. This is not necessary on platforms where ports have interrupts internally
  * hard wired (eg, system on a chip implementations).
  */
-static void virt_serial_config_port(struct uart_port*, int type)
+static void virt_serial_config_port(struct uart_port *port, int type)
 {
 }
 
