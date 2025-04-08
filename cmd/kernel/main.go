@@ -7,10 +7,6 @@ import (
 	"os"
 )
 
-const (
-	VirtSerialControlDevice = "/dev/vrtsctl"
-)
-
 func main() {
 	app := &cli.App{
 		Name:  "ioctl-tool",
@@ -22,8 +18,9 @@ func main() {
 				Action: AddVirtualSerial,
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:  "device",
-						Usage: "Device name, e.g. ttyVCOM0",
+						Name:    "device",
+						Aliases: []string{"devname"},
+						Usage:   "Device name, e.g. ttyVCOM0",
 					},
 					&cli.UintFlag{
 						Name:  "baud",
@@ -38,10 +35,17 @@ func main() {
 				Action: RemoveVirtualSerial,
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:  "device",
-						Usage: "Device name, e.g. ttyVCOM0",
+						Name:    "device",
+						Aliases: []string{"devname"},
+						Usage:   "Device name, e.g. ttyVCOM0",
 					},
 				},
+			},
+			{
+				Name:   "sample",
+				Usage:  "Create sample virtual serial",
+				Action: CreateSampleSerial,
+				Hidden: true,
 			},
 		},
 	}
@@ -80,6 +84,19 @@ func RemoveVirtualSerial(ctx *cli.Context) error {
 		DeviceName: ctx.String("device"),
 	}
 	err = controlDevice.RemoveSerialPort(request)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func CreateSampleSerial(ctx *cli.Context) error {
+	controlDevice, err := ctrl.NewControlDevice()
+	if err != nil {
+		return err
+	}
+	defer controlDevice.Close()
+	err = controlDevice.CreateSampleSerialPort()
 	if err != nil {
 		return err
 	}

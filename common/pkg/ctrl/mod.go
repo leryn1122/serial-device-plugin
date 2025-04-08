@@ -54,3 +54,11 @@ func (d *ControlDevice) RemoveSerialPort(request RemoveSerialPortRequest) error 
 	}
 	return nil
 }
+
+func (d *ControlDevice) CreateSampleSerialPort() error {
+	err := ioctl.Ioctl(d.fd, VirtSerialIoctlPreserve)
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove the virtual serial port")
+	}
+	return nil
+}
